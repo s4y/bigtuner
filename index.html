@@ -1,0 +1,349 @@
+<!DOCTYPE html>
+<style>
+
+html, body, #visualizer, canvas {
+  height: 100%;
+  font: 14px system-ui, sans-serif;
+}
+
+body {
+  margin: 0;
+  position: relative;
+}
+
+canvas {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+
+#enableAudioContext {
+  position: absolute;
+  top: 10px;
+  left: 10px;
+  font: inherit;
+  background: rgba(0, 0, 0, 0.7);
+  color: white;
+  border: none;
+  outline: none;
+  font-size: 2em;
+  padding: 1em 1.5em;
+}
+
+#enableAudioContext:not(.visible) {
+  display: none;
+}
+
+#peakContainer {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+}
+
+.peak {
+  position: absolute;
+  box-sizing: border-box;
+  left: -1.5em;
+  top: 0;
+  font-size: 2em;
+  padding: 0.5em;
+  background: #eef;
+  border: 4px solid #aaf;
+  width: 3em;
+  height: 3em;
+  border-radius: 1.5em;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  text-align: center;
+}
+
+@media (prefers-color-scheme: dark) {
+  body {
+    background: black;
+    color: white;
+  }
+
+  .peak {
+    border-color: #005;
+    background-color: #445;
+  }
+}
+
+</style>
+<meta name=viewport content="width=device-width, initial-scale=1">
+<div id=visualizer></div>
+<div id=peakContainer></div>
+<button id=enableAudioContext>Start</button>
+<script>
+
+const kMaxFrequency = 5000;
+const planeMesh = new Float32Array([
+  -1, 1, 0, -1, -1, 0,
+  1, 1, 0, 1, -1, 0,
+]);
+
+class GLCanvas {
+  get contextOptions() {
+    return {
+      antialias: false,
+      powerPreference: 'low-power',
+    };
+  }
+
+  get vs() {
+    return `
+    attribute vec3 p_in;
+    varying vec3 p;
+
+    void main() {
+      p = p_in;
+      gl_Position = vec4(p_in, 1.);
+    }
+    `;
+  }
+
+  get fs() {
+    return `
+    precision mediump float;
+    varying vec3 p;
+    uniform sampler2D sf;
+
+    void main() {
+      vec2 uv = p.xy / 2. + .5;
+      float bri = texture2D(sf, uv)[0];
+      bri = bri - uv.y;
+      bri = 1. - step(bri, 0.);
+      gl_FragColor = vec4(.4, .4, 1., 1.) * bri;
+    }
+    `;
+  }
+
+  get el() {
+    if (!this._el) {
+      this._el = document.createElement('canvas');
+      this.render();
+    }
+    return this._el;
+  }
+
+  constructor(analyserBuf) {
+    this.analyserBuf = analyserBuf;
+  }
+
+  initGl() {
+    const {gl} = this;
+    const vs = gl.createShader(gl.VERTEX_SHADER);
+    gl.shaderSource(vs, this.vs);
+    gl.compileShader(vs);
+    // console.log(gl.getShaderInfoLog(vs));
+    const fs = gl.createShader(gl.FRAGMENT_SHADER);
+    gl.shaderSource(fs, this.fs);
+    gl.compileShader(fs);
+    console.log(gl.getShaderInfoLog(fs));
+    const prog = this.prog = gl.createProgram();
+    gl.attachShader(prog, vs);
+    gl.attachShader(prog, fs);
+    gl.linkProgram(prog);
+    // if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) {
+    //   console.log(gl.getProgramInfoLog(prog));
+    //   return;
+    // }
+    gl.useProgram(prog);
+    this.aspectLoc = gl.getUniformLocation(prog, "aspect");
+
+    const buffer = gl.createBuffer();
+    gl.bindBuffer(gl.ARRAY_BUFFER, buffer);
+    gl.bufferData(gl.ARRAY_BUFFER, planeMesh, gl.STATIC_DRAW);
+
+    const pLoc = gl.getUniformLocation(prog, "p_in");
+    gl.enableVertexAttribArray(pLoc);
+    gl.vertexAttribPointer(pLoc, 3, gl.FLOAT, false, 0, 0);
+
+    const tex = this.tex = gl.createTexture();
+    const sfLoc = gl.getUniformLocation(this.prog, 'sf');
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, tex);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+    gl.clearColor(0, 0, 0, 1);
+  }
+
+  render() {
+    const {el} = this;
+    this.gl = el.getContext('webgl', this.contextOptions);
+    this.initGl();
+
+    if (!this.resizeObserver) {
+      this.resizeObserver = new ResizeObserver(() => {
+        this.resize();
+      });
+    }
+    this.resizeObserver.disconnect();
+    this.resizeObserver.observe(el);
+  }
+
+  resize() {
+    const {el, gl} = this;
+    el.width = el.clientWidth * devicePixelRatio;
+    el.height = el.clientHeight * devicePixelRatio;
+    gl.viewport(0, 0, gl.drawingBufferWidth, gl.drawingBufferHeight);
+    gl.uniform1f(this.aspectLoc, el.width / el.height);
+  }
+
+  draw() {
+    const {gl} = this;
+
+    gl.texImage2D(
+      gl.TEXTURE_2D, 0, gl.LUMINANCE,
+      this.analyserBuf.length, 1, 0,
+      gl.LUMINANCE, gl.UNSIGNED_BYTE, this.analyserBuf
+    );
+
+    gl.clear(gl.COLOR_BUFFER_BIT);
+    gl.drawArrays(gl.TRIANGLE_STRIP, 0, planeMesh.length / 3);
+  }
+}
+
+const ac = new (window.AudioContext || window.webkitAudioContext)();
+const analyser = ac.createAnalyser();
+analyser.fftSize = 32768;
+analyser.smoothingTimeConstant = 0.1;
+
+const freqData = new Uint8Array(Math.floor(kMaxFrequency / ac.sampleRate * (analyser.fftSize / 2)));
+const smoothFreqData = new Uint8Array(freqData.length);
+
+const checkState = () => {
+  if (ac.state === 'suspended') {
+    enableAudioContext.classList.add('visible');
+    return;
+  }
+
+  enableAudioContext.classList.remove('visible');
+
+  navigator.mediaDevices.getUserMedia({
+    video: false,
+    audio: true,
+  })
+  .then(s => {
+    const source = ac.createMediaStreamSource(s);
+    source.connect(analyser);
+  });
+
+};
+
+enableAudioContext.addEventListener('click', e => {
+  ac.resume();
+});
+
+ac.resume();
+ac.addEventListener('statechange', checkState);
+checkState();
+
+const c = new GLCanvas(smoothFreqData);
+visualizer.appendChild(c.el);
+
+const peakToFreq = p => p * ac.sampleRate / (analyser.fftSize);
+
+const noteTable = ['A', 'A#', 'B', 'C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#'];
+const negMod = (x, n) => ((x % n) + n) % n;
+const freqToNote = freq => {
+  const noteNumber = Math.round(Math.log2(freq / 440) * 12);
+  return noteTable[negMod(noteNumber, 12)] + Math.ceil((noteNumber - 2) / 12 + 4);
+}
+const peakEls = [];
+
+let running = true;
+
+const smoothArray = (from, to, amount) => {
+  let tot = 0;
+  for (let i = 0; i < freqData.length; i++) {
+    tot += freqData[i];
+    if (i >= amount / 2)
+      smoothFreqData[i - amount / 2] = tot / Math.min(i + 1, amount);
+    if (i >= amount)
+      tot -= freqData[i-amount];
+  }
+};
+
+
+const doDraw = () => {
+  analyser.getByteFrequencyData(freqData);
+  smoothArray(freqData, smoothFreqData, 20);
+
+  // let peakStart = 0;
+  // let peaks = [];
+  let avg = 0;
+  let max = 0;
+  for (let i = 0; i < smoothFreqData.length; i++) {
+    avg += smoothFreqData[i] / smoothFreqData.length;
+    max = Math.max(max, smoothFreqData[i]);
+  }
+
+  let peakMax = null;
+  let peakStart = null;
+  let peaks = [];
+  let peakHeights = [];
+  for (let i = 0; i < smoothFreqData.length; i++) {
+    const val = smoothFreqData[i];
+    if (peakMax === null && val > max * 0.5) {
+      peakStart = i;
+      peakMax = val;
+    }
+    if (peakMax !== null) {
+      if (val >= peakMax) {
+        peakMax = val;
+      } else if (val < max * 0.5) {
+        peaks.push((peakStart + i)/2);
+        peakHeights.push(peakMax);
+        peakMax = null;
+      }
+    }
+  }
+
+  while (peakEls.length < peaks.length) {
+    const el = document.createElement('div');
+    el.classList.add('peak');
+    peakContainer.insertBefore(el, peakContainer.firstChild);
+    peakEls.push(el);
+  }
+  let ii = 0;
+  for (let i = 0; i < peaks.length; i++) {
+    const freq = peakToFreq(peaks[i]);
+    if (freq < 50)
+      continue;
+    let skip = false;
+    for (let j = 0; j < peaks.length; j++) {
+      const div = Math.log2(peaks[i]) / Math.log2(peaks[j]);
+      if (peakHeights[j] > peakHeights[i] && Math.abs(div - Math.round(div)) < 0.05) {
+        skip = true;
+        break;
+      }
+    }
+    if (skip)
+      continue;
+    const el = peakEls[ii++];
+    // el.textContent = Math.round(freqToNote(freq));
+    el.textContent = freqToNote(freq);
+    el.style.transform = `translate(${peaks[i]/smoothFreqData.length*peakContainer.offsetWidth}px, ${Math.max(0, (1 - peakHeights[i]/255) * peakContainer.offsetHeight - el.offsetHeight)}px)`;
+  }
+  while (peakEls.length > ii) {
+    const el = peakEls[peakEls.length-1];
+    peakContainer.removeChild(el);
+    peakEls.length -= 1;
+  }
+
+  c.draw();
+  if (running)
+    requestAnimationFrame(doDraw);
+}
+
+doDraw();
+
+
+</script>
